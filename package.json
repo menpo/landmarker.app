@@ -21,6 +21,22 @@
     "nsis": {
       "perMachine": true
     },
+    "files": [
+      "**/*",
+      "!menpo${/*}",
+      "!.git${/*}",
+      "!.editorconfig",
+      "!.esformatter",
+      "!.eslintrc",
+      "!.gitignore",
+      "!.gitmodules",
+      "!.travis.yml",
+      "!appveyor.yml",
+      "!LICENSE",
+      "!readme.md",
+      "!tsconfig.json",
+      "!tslint.json"
+    ],
     "publish": [
       {
         "provider": "github"
@@ -65,7 +81,7 @@
     "es6-promise": "^4.0.5",
     "file-loader": "^0.11.0",
     "jquery": "^3.1.1",
-    "js-yaml": "^3.3.1",
+    "js-yaml": "^3.8.4",
     "json-loader": "^0.5.4",
     "lodash.assign": "^4.2.0",
     "node-sass": "^3.4.0",

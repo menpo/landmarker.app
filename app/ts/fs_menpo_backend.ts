@@ -1,6 +1,7 @@
-import {  ipcRenderer } from 'electron'
+import { ipcRenderer } from 'electron'
 import * as fs from 'fs'
 import * as Path from 'path'
+import * as _ from 'underscore'
 
 import * as THREE from 'three'
 
@@ -11,6 +12,9 @@ import {
 import { Backend } from '../../landmarker.io/src/ts/app/backend/base'
 import Template from '../../landmarker.io/src/ts/app/template'
 import { notify, loading } from '../../landmarker.io/src/ts/app/view/notification'
+import XMLHttpRequestPromise from '../../landmarker.io/src/ts/app/lib/requests'
+import { LJSONFile } from '../../landmarker.io/src/ts/app/model/landmark/group'
+import { JSONLmPoint } from '../../landmarker.io/src/ts/app/model/landmark/landmark'
 
 import OBJLoader from '../../landmarker.io/src/ts/app/lib/obj_loader'
 import STLLoader from '../../landmarker.io/src/ts/app/lib/stl_loader'
@@ -19,6 +23,13 @@ import bus, * as EVENTS from './bus'
 
 const IMAGE_EXTENSIONS = ['jpeg', 'jpg', 'png']
 const MESH_EXTENSIONS = ['obj', 'stl']
+
+// TODO: the list of annotated assets that have incorporated into the model does not persist after restart!
+// TODO: deleting pickle files but leaving ljsons causes error!
+// TODO: revisiting annotated assets causes a phantom change that means it needs to be saved before scrolling! is this a new issue?
+// TODO: scrolling through assets that have already been done and saving them causes them to be resent to the python server!
+// TODO: save completed landmark groups as they are completed and saved (in memory and storage)
+// TODO: make it obvious to the user (though some ui element) that automatic annotation is in effect. In an effort to communicate what the two constraints are!
 
 // promise-polyfill doesn't expose the 'any' function so this is a replacement
 // which resolves with the first resolving promise in the array or rejects
@@ -72,15 +83,75 @@ function commonPrefix (path1, path2) {
     return arr1.slice(0, i).join(Path.sep)
 }
 
+function commonPrefixFromArray (paths: string[]) {
+    // Must not be empty
+    let prefix = paths[0]
+
+    let i = 0
+    for (i = 1; i < paths.length; i++) {
+        prefix = commonPrefix(prefix, paths[i])
+        if (prefix === '') {
+            break
+        }
+    }
+    return prefix
+}
+
+function checkCompleteAnnotation(ljson): boolean {
+    for (let i = 0; i < ljson.landmarks.points.length; i++) {
+        if (ljson.landmarks.points[i][0] === null) {
+            // Incomplete annotation
+            return false
+        }
+    }
+    return true
+}
+
+function softValidateAndCorrect(jsonFile: LJSONFile | string, template: Template, dims=2): [boolean, LJSONFile] {
+    const json: LJSONFile = typeof jsonFile === 'string' ? JSON.parse(jsonFile) : jsonFile
+
+    const ljson: LJSONFile = template.emptyLJSON(dims)
+    json.landmarks.connectivity = ljson.landmarks.connectivity
+    let ok: boolean
+
+    ok = json.version === ljson.version
+    ok = ok && _.isEqual(json.labels, ljson.labels)
+    ok = ok && ljson.landmarks.points.every(p => p.length === dims)
+    return [ok, ok ? json : ljson]
+}
+
+function equivalentLJSON(ljson1: LJSONFile, ljson2: LJSONFile): boolean {
+    const nPoints: number = ljson1.landmarks.points.length
+    for (let i = 0; i < nPoints; i++) {
+        const point1: JSONLmPoint = ljson1.landmarks.points[i]
+        const point2: JSONLmPoint = ljson2.landmarks.points[i]
+        if (point1[0] !== point2[0] || point1[1] !== point2[1]) {
+            return false
+        }
+    }
+    return true
+}
+
+function postJSON(url: string, {headers={}, data={}, auth=false}={}): any {
+    return XMLHttpRequestPromise(url, {
+        headers,
+        auth,
+        responseType: 'json',
+        method: 'POST',
+        data: JSON.stringify(data),
+        contentType: 'application/json;charset=UTF-8'
+    })
+}
+
 const DROP_TYPE = {
     ASSET: 'ASSET',
     TEMPLATE: 'TEMPLATE'
 }
 
-export default class FSBackend implements Backend {
+export default class FSMenpoBackend implements Backend {
 
     // Used to identify backends in local storage
-    static Type = 'FS'
+    static Type = 'FSMenpo'
 
     _assets: string[] = []
     _assetsProps = {}
@@ -94,10 +165,24 @@ export default class FSBackend implements Backend {
     _cfg
     _pickTemplateCallback: {success, error} | undefined
 
+    url: string = 'http://localhost:5001/'
+
+    // All fully annotated assets
+    _fullyAnnotatedAssets: {[assetBaseId: string]: LJSONFile} = {}
+    // Assets that have not been used to increment the deformable model yet
+    _toBeTrained: string[] = []
+    // The number of full annotations to activate automatic annotation
+    minimumTrainingAssets: number = 10
+    // Number of full annotations between each model incrementation
+    automaticAnnotationInterval: number = 5
+    callingMenpo: boolean = false
+    menpoCallMessage: string = ''
+    menpoXhr?: XMLHttpRequest
+
     constructor(cfg) {
         this._cfg = cfg
         this._cfg.set({
-            'BACKEND_TYPE': FSBackend.Type
+            'BACKEND_TYPE': FSMenpoBackend.Type
         }, true)
 
         ipcRenderer.on('fs-backend-selected-template', ((event, arg) => {this.addTemplates.call(this, arg)}).bind(this))
@@ -105,22 +190,12 @@ export default class FSBackend implements Backend {
     }
 
     computeCollection() {
-        let prefix = this._assets[0]
-
-        let i = 0
-        for (i = 1; i < this._assets.length; i++) {
-            prefix = commonPrefix(prefix, this._assets[i])
-            if (prefix === '') {
-                break
-            }
-        }
-
-        this._prefix = prefix
-        this._collection = `${prefix} - (${this._assets.length} assets)`
+        this._prefix = commonPrefixFromArray(this._assets)
+        this._collection = `${this._prefix} - (${this._assets.length} assets)`
         bus.emit(EVENTS.FS_CHANGED_ASSETS)
 
         this._cfg.set({
-            FS_ASSETS: this._assets
+            FS_MENPO_ASSETS: this._assets
         }, true)
 
     }
@@ -140,7 +215,7 @@ export default class FSBackend implements Backend {
             this.mode = this.mode || 'image'
         }
 
-        this._cfg.set({FS_MODE: this.mode}, true)
+        this._cfg.set({FS_MENPO_MODE: this.mode}, true)
     }
 
     selectAssets() {
@@ -268,6 +343,7 @@ export default class FSBackend implements Backend {
     }
 
     addTemplate(path) {
+        // TODO: if there's a duplicate then it appends "-{i}". Is this okay?
 
         const ext = extname(path)
         if (!(ext in Template.Parsers)) {
@@ -308,6 +384,7 @@ export default class FSBackend implements Backend {
     }
 
     fetchMode() {
+        // TODO: check python backend
         return Promise.resolve(this.mode)
     }
 
@@ -370,7 +447,7 @@ export default class FSBackend implements Backend {
     }
 
     fetchGeometry(assetId) {
-        console.time(`FSBackend#fetchGeometry#${assetId}`)
+        console.time(`FSMenpoBackend#fetchGeometry#${assetId}`)
         const assetPath = this.pathFromId(assetId)
         const q = new Promise((resolve, reject) => {
             fs.readFile(assetPath, (err, data) => {
@@ -388,10 +465,10 @@ export default class FSBackend implements Backend {
                         for (let i = 0; i < len; ++i) {
                             view[i] = data[i]
                         }
-                        console.timeEnd(`FSBackend#fetchGeometry#${assetId}`)
+                        console.timeEnd(`FSMenpoBackend#fetchGeometry#${assetId}`)
                         resolve(STLLoader(ab))
                     } else {
-                        console.timeEnd(`FSBackend#fetchGeometry#${assetId}`)
+                        console.timeEnd(`FSMenpoBackend#fetchGeometry#${assetId}`)
                         reject(`Unrecognized extension ${ext}`)
                     }
                 }
@@ -428,10 +505,42 @@ export default class FSBackend implements Backend {
         })
     }
 
-    saveLandmarkGroup(id: string, type: string, json) {
+    saveLandmarkGroup(id: string, type: string, json: LJSONFile) {
         const fpath = `${withoutExt(this.pathFromId(id))}_${type}.ljson`
         const async = loading.start()
+        const annotationComplete: boolean = checkCompleteAnnotation(json)
+        // TODO: check for changed completed annotation
+        const validTrainingAnnotation: boolean = annotationComplete
+            && (this._fullyAnnotatedAssets[withoutExt(id)] === undefined || !equivalentLJSON(json, this._fullyAnnotatedAssets[withoutExt(id)]))
+        if (validTrainingAnnotation) {
+            this._fullyAnnotatedAssets[withoutExt(id)] = json
+            this._toBeTrained.push(id)
+        }
         return new Promise((resolve, reject) => {
+            if (this._deformableModelRefreshDue() && validTrainingAnnotation) {
+                fs.writeFile(fpath, JSON.stringify(json), 'utf8', (err) => {
+                    if (err) {
+                        loading.stop(async)
+                        reject(err)
+                    } else {
+                        this._refreshDeformableModel(type).then(() => {
+                            loading.stop(async)
+                            resolve()
+                        }, (err: any) => {
+                            // account for abort
+                            if (!err.message || err.message !== 'Aborted') {
+                                notify({type: 'error', msg: (err.message || err)})
+                            }
+                            if (err.message === 'Aborted') {
+                                notify({type: 'success', msg: 'Deformable model refresh aborted sucessfully'})
+                            }
+                            loading.stop(async)
+                            resolve()
+                        })
+                    }
+                })
+                return
+            }
             fs.writeFile(fpath, JSON.stringify(json), 'utf8', (err) => {
                 if (err) {
                     loading.stop(async)
@@ -498,6 +607,179 @@ export default class FSBackend implements Backend {
             console.log(`Failed to process dropped content`, errs)
         })
 
+    }
+
+    refreshTrainingAssets(type: string): void {
+        // Initial array of training assets
+        this._fetchAndSetFullyAnnotatedAssets(type).then(() => {}, (err) => {
+            console.log(err.message)
+        })
+    }
+
+    fetchMeanShape(type: string): Promise<LJSONFile> {
+        const tmpl = this._templates[type]
+        if (this.callingMenpo) {
+            return new Promise<{}>((resolve, reject) => reject(new Error('Fetching mean shape failed - conflict with another Menpo call')))
+        }
+        const async = loading.start()
+        const postPromise = postJSON(this.url + 'get_mean_shape', {data: {
+                                fpath: commonPrefixFromArray(this._assets),
+                                group: type
+                            }})
+        this.menpoXhr = postPromise.xhr()
+        this.menpoCallMessage = 'Fetching initial shape...'
+        this.callingMenpo = true
+        return new Promise<LJSONFile>((resolve, reject) => {
+            postPromise.then((json: any) => {
+                json.version = 2
+                // Menpofit messes with the connectivity
+                const [ok, ljson] = softValidateAndCorrect(json, tmpl, 2)
+                if (!ok) {
+                    notify({
+                        msg: 'Found invalid landmarks, falling back to empty landmarks'
+                    })
+                }
+                loading.stop(async)
+                this._closeMenpoCall()
+                resolve(ljson)
+            }, (err: any) => {
+                // hopefully an abort
+                loading.stop(async)
+                this._closeMenpoCall()
+                reject(err)
+            })
+        })
+    }
+
+    fetchFittedShape(ljsonFile: LJSONFile, imgId: string, type: string): Promise<LJSONFile> {
+        const imgPath = this.pathFromId(imgId)
+        const tmpl = this._templates[type]
+        if (this.callingMenpo) {
+            return new Promise<{}>((resolve, reject) => reject(new Error('Fetching refined shape failed - conflict with another Menpo call')))
+        }
+        const async = loading.start()
+        const postPromise = postJSON(this.url + 'get_fit', {data: {
+                                fpath: commonPrefixFromArray(this._assets),
+                                path: imgPath,
+                                ljson: JSON.stringify(ljsonFile),
+                                group: type
+                            }})
+        this.menpoXhr = postPromise.xhr()
+        this.menpoCallMessage = 'Fetching refined shape...'
+        this.callingMenpo = true
+        return new Promise<LJSONFile>((resolve, reject) => {
+            postPromise.then((json: any) => {
+                json.version = 2
+                // Menpofit messes with the connectivity
+                const [ok, ljson] = softValidateAndCorrect(json, tmpl, 2)
+                if (!ok) {
+                    notify({
+                        msg: 'Found invalid landmarks, falling back to empty landmarks'
+                    })
+                }
+                loading.stop(async)
+                this._closeMenpoCall()
+                resolve(ljson)
+            }, (err: any) => {
+                // hopefully an abort
+                loading.stop(async)
+                this._closeMenpoCall()
+                reject(err)
+            })
+        })
+    }
+
+    _fetchAndSetFullyAnnotatedAssets(type: string): Promise<{}> {
+        if (this.callingMenpo) {
+            if (this.menpoCallMessage === 'Fetching completed annotations...') {
+                // Fail silently. We expect these calls to step on each other at times.
+                return new Promise<{}>((resolve) => resolve())
+            }
+            return new Promise<{}>((resolve, reject) => reject(new Error('Fetching completed annotations failed - conflict with another Menpo call')))
+        }
+        const async = loading.start()
+        const postPromise = postJSON(this.url + 'get_completed_annotations', {data: {
+                                fpath: commonPrefixFromArray(this._assets),
+                                group: type
+                            }})
+        const tmpl = this._templates[type]
+        this.menpoXhr = postPromise.xhr()
+        this.menpoCallMessage = 'Fetching completed annotations...'
+        this.callingMenpo = true
+        return new Promise<{}>((resolve, reject) => {
+            postPromise.then((json: any) => {
+                for (let assetBaseId in json) {
+                    let assetJson = json[assetBaseId]
+                    assetJson.version = 2
+                    // Menpofit messes with the connectivity
+                    const [ok, ljson]: [boolean, LJSONFile] = softValidateAndCorrect(assetJson, tmpl, 2)
+                    if (!ok) {
+                        notify({
+                            msg: 'Found invalid landmarks, skipping over annotation'
+                        })
+                        continue
+                    }
+                    this._fullyAnnotatedAssets[assetBaseId] = ljson
+                }
+                loading.stop(async)
+                this._closeMenpoCall()
+                resolve()
+            }, (err: any) => {
+                // hopefully an abort
+                loading.stop(async)
+                this._closeMenpoCall()
+                reject(err)
+            })
+        })
+    }
+
+    _deformableModelRefreshDue(): boolean {
+        return this.automaticAnnotationOn() && (Object.keys(this._fullyAnnotatedAssets).length - this.minimumTrainingAssets) % this.automaticAnnotationInterval === 0
+            && this._toBeTrained.length >= 2
+        // note: the last constraint is due to the backend's inability to increment deformable models with a single image
+    }
+
+    automaticAnnotationOn(): boolean {
+        return Object.keys(this._fullyAnnotatedAssets).length >= this.minimumTrainingAssets
+    }
+
+    _refreshDeformableModel(type: string): Promise<{}> {
+        if (this.callingMenpo) {
+            return new Promise<{}>((resolve, reject) => reject(new Error('Updating deformable model failed - conflict with another Menpo call')))
+        }
+        const postPromise = postJSON(this.url + 'build_aam', {data: {
+                                fpath: commonPrefixFromArray(this._assets),
+                                paths: this._toBeTrained.map((id: string) => {return this.pathFromId(id)}),
+                                group: type
+                            }})
+        this.menpoXhr = postPromise.xhr()
+        this.menpoCallMessage = 'Updating deformable model...'
+        this.callingMenpo = true
+        return new Promise<{}>((resolve, reject) => {
+            postPromise.then(() => {
+                this._toBeTrained = []
+                this._closeMenpoCall()
+                resolve()
+            }, (err: any) => {
+                // hopefully an abort
+                this._closeMenpoCall()
+                reject(err)
+            })
+        })
+    }
+
+    _closeMenpoCall(): void {
+        this.menpoCallMessage = ''
+        this.callingMenpo = false
+        this.menpoXhr = undefined
+    }
+
+    cancelMenpoCall(): void {
+        if (!this.menpoXhr || !this.callingMenpo) {
+            return
+        }
+        this.menpoXhr.abort()
+        // 'this.menpoXhr = undefined' is covered by 'then' clauses
     }
 
 }
